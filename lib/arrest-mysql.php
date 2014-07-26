@@ -14,6 +14,7 @@
 * Version 1.0
 */
 require('lib/db.php');
+require('lib/options.php');
 
 class ArrestMySQL {
 
@@ -42,6 +43,8 @@ class ArrestMySQL {
 		*/
 		private $table_index;
 
+		private $config = [];
+
 		/**
 		* Create an instance, optionally setting a base URI
 		*
@@ -58,12 +61,15 @@ class ArrestMySQL {
 		* @param string $base_uri Optional base URI if not in root folder
 		* @access public
 		*/
-		public function __construct($db_config, $base_uri = '')
+		public function __construct($config, $base_uri = '')
 		{
-			$this->db = new Database($db_config);
+			$this->config = $config;
+
+			$this->db = new Database($config['database']);
+
 			if(!$this->db->init()) throw new Exception($this->db->get_error());
 
-			$this->db_structure = $this->map_db($db_config['database']);
+			$this->db_structure = $this->map_db($config['database']['database']);
 			$this->segments = $this->get_uri_segments($base_uri);
 			$this->table_index = array();
 		}
@@ -75,7 +81,17 @@ class ArrestMySQL {
 		*/
 		public function rest()
 		{
+				header('Access-Control-Allow-Origin: *');
+				header('Access-Control-Allow-Methods: OPTIONS, GET, POST, PUT, DELETE');
+				header('Access-Control-Allow-Headers: Content-Type, X-Requested-With');
 				header('Content-type: application/json');
+
+				if ($this->config['use_cookie']) {
+					if ($_COOKIE['username'] !== $this->config['api_login'][0] || $_COOKIE['password'] !== $this->config['api_login'][1]) {
+						die('{"error":{"message":"Not Found","code":404}}');
+					}
+				}
+
 				/*
 				create > POST   /table
 				read   > GET    /table[/id]
@@ -94,6 +110,9 @@ class ArrestMySQL {
 								break;
 						case 'DELETE':
 								$this->delete();
+								break;
+						case 'OPTIONS':
+								$this->options();
 								break;
 				}
 		}
@@ -122,14 +141,14 @@ class ArrestMySQL {
 				// Map db structure to array
 			$tables_arr = array();
 			$this->db->query('SHOW TABLES FROM '. $database);
-			
+
 			while($table = $this->db->fetch_array()){
 				if(isset($table['Tables_in_'. $database])){
 					$table_name = $table['Tables_in_'. $database];
 					$tables_arr[$table_name] = array();
 				}
 			}
-			
+
 			foreach($tables_arr as $table_name=>$val){
 				$this->db->query('SHOW COLUMNS FROM '. $table_name);
 				$fields = $this->db->fetch_all();
@@ -138,7 +157,7 @@ class ArrestMySQL {
 
 			// loop thru table columns to find any PRIMARY keys
 			$fieldKeys = array();
-			
+
 			foreach ($fields as $field) {
 				// @NOTE: If Key is PRI, the column is a PRIMARY KEY or is one of the columns in a multiple-column (composite primary key) PRIMARY KEY.
 				if (strcasecmp($field['Key'], 'PRI') == 0) {
@@ -150,8 +169,8 @@ class ArrestMySQL {
 			// @WARNING: as lib/db.php is using index() as field=value in WHERE CLAUSE, on tables with composite PRIMARY KEY extract last of the keys
 			if (count($fieldKeys) > 0) {
 				$this->table_index[$table_name] = end($fieldKeys);
-			}			
-			
+			}
+
 			return $tables_arr;
 		}
 
@@ -193,7 +212,10 @@ class ArrestMySQL {
 		*/
 		private function segment($index)
 		{
-				if(isset($this->segments[$index])) return $this->segments[$index];
+				if(isset($this->segments[$index])) {
+					return $this->segments[$index];
+				}
+
 				return false;
 		}
 
@@ -242,7 +264,7 @@ class ArrestMySQL {
 			foreach ($columns_in_table as $column_in_table) {
 				if ($column_in_table['Field'] == $column) {
 					$found = TRUE;
-					break;	
+					break;
 				}
 			}
 
@@ -272,7 +294,7 @@ class ArrestMySQL {
 				return $error;
 			}
 
-			$value = filter_var($value, FILTER_SANITIZE_STRING, FILTER_FLAG_NO_ENCODE_QUOTES | FILTER_FLAG_STRIP_LOW | FILTER_FLAG_STRIP_HIGH);
+			$value = $this->filter($value);
 
 			$this->db->select('*')
 				->from($table)
@@ -438,6 +460,49 @@ class ArrestMySQL {
 				}
 		}
 
+		private function options() {
+			$error = json_encode(array('error' => array(
+				'message' => 'Not Found',
+				'code' => 404
+			)));
+
+			$controller = $this->segment(0);
+			$controller = ($controller) ? $controller : 'main';
+			array_shift($this->segments);
+
+			$method = $this->segment(0);
+			$method = ($method) ? $method : 'index';
+			array_shift($this->segments);
+
+			$file = realpath(__DIR__.'/../options/'.$controller.'.php');
+
+			if (!$file) {
+				die($error);
+			}
+
+			require_once($file);
+
+			$controller .= '_option';
+
+			if (!class_exists($controller,FALSE)) {
+				die($error);
+			}
+
+			/* instantiate it */
+			$class = new $controller($this->config,$this->segments,$this->db,$this->db_structure);
+
+			$method .= 'Action';
+
+			/* does that method even exist? */
+			if (!method_exists($class, $method)) {
+				die($error);
+			}
+
+			$json = $class->$method();
+
+			die(json_encode($json));
+		}
+
 		/**
 		* Helper function to retrieve $_GET variables
 		*
@@ -485,6 +550,18 @@ class ArrestMySQL {
 				$output = array();
 				parse_str(file_get_contents('php://input'), $output);
 				return $output;
+		}
+		
+		private function filter($input) {
+			/* basic strip
+			FILTER_FLAG_NO_ENCODE_QUOTES - This flag does not encode quotes
+			FILTER_FLAG_STRIP_LOW - Strip characters with ASCII value below 32
+			FILTER_FLAG_STRIP_HIGH - Strip characters with ASCII value above 127
+			*/
+			$a = array('{#CHR10#}','{#CHR13#}');
+			$b = array(chr(10),chr(13));
+	
+			return str_replace($a,$b,filter_var(str_replace($b,$a,$input), FILTER_SANITIZE_STRING, FILTER_FLAG_NO_ENCODE_QUOTES | FILTER_FLAG_STRIP_LOW | FILTER_FLAG_STRIP_HIGH));
 		}
 
 }
